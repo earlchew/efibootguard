@@ -147,13 +147,13 @@ bool bgenv_init(void)
 	}
 	for (int i = 0; i < ENV_NUM_CONFIG_PARTS; i++) {
 		read_env(&config_parts[i], &envdata[i]);
-		uint32_t sum = crc32(0, (Bytef *)&envdata[i],
+		uint32_t sum = bgenv_crc32(0, &envdata[i],
 		    sizeof(BG_ENVDATA) - sizeof(envdata[i].crc32));
 		if (envdata[i].crc32 != sum) {
 			VERBOSE(stderr, "Invalid CRC32!\n");
 			/* clear invalid environment */
 			memset(&envdata[i], 0, sizeof(BG_ENVDATA));
-			envdata[i].crc32 = crc32(0, (Bytef *)&envdata[i],
+			envdata[i].crc32 = bgenv_crc32(0, &envdata[i],
 			    sizeof(BG_ENVDATA) - sizeof(envdata[i].crc32));
 		}
 	}
