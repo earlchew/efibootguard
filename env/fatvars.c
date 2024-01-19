@@ -16,59 +16,115 @@
 #include <efilib.h>
 #include <efiapi.h>
 #include <bootguard.h>
+#include <configuration.h>
 #include <utils.h>
 #include <syspart.h>
 #include <envdata.h>
 
-static int current_partition = 0;
-static BG_ENVDATA *env;
+struct EnvDataVolume {
+	int volume_index;
+	BG_ENVDATA envdata;
+};
 
-static BG_STATUS save_current_config(VOID)
+static unsigned config_state_ranking(const BG_ENVDATA *envdata)
+{
+	unsigned rank = -1;
+
+	/* Assign a rank to each of the states. Prefer INSTALLED,
+	 * then TESTING, over OK, but eschew FAILED and unknown. */
+
+	if (envdata) {
+		switch (envdata->ustate) {
+		case USTATE_INSTALLED: rank = 0; break;
+		case USTATE_TESTING:   rank = 1; break;
+		case USTATE_OK:        rank = 2; break;
+		default:               rank = 3; break;
+		}
+	}
+
+	return rank;
+}
+
+static void sift_envdata_volume(
+	struct EnvDataVolume **lhsp, struct EnvDataVolume **rhsp)
+{
+	struct EnvDataVolume *lhs = *lhsp;
+	struct EnvDataVolume *rhs = *rhsp;
+
+	unsigned lstaterank = config_state_ranking(lhs ? &lhs->envdata : NULL);
+	unsigned rstaterank = config_state_ranking(rhs ? &rhs->envdata : NULL);
+
+	/* Compare the lhs and rhs, swapping to ensure that the lhs is
+	 * preferred. Preferred the configuration that is not in_progress,
+	 * has the highest revision, and has the lower ranked state.
+	 *
+	 * If lhs and rhs are equal, prefer the copy on the boot volume,
+	 * otherwise prefer the copy on the first occurring partition.
+	 * This is relevant for scenarios where a backup is taken of
+	 * EFI System Partition, and the config is stored on the ESP. */
+
+	BOOLEAN swap;
+
+	if (!rhs)
+		swap = FALSE;
+	else if (!lhs)
+		swap = TRUE;
+	else {
+		BOOLEAN lbootvolume = IsOnBootVolume(
+			volumes[lhs->volume_index].devpath);
+
+		BOOLEAN rbootvolume = IsOnBootVolume(
+			volumes[rhs->volume_index].devpath);
+
+		if (lhs->envdata.in_progress != rhs->envdata.in_progress)
+			swap = (lhs->envdata.in_progress >
+					rhs->envdata.in_progress);
+		else if (lhs->envdata.revision != rhs->envdata.revision)
+			swap = (lhs->envdata.revision < rhs->envdata.revision);
+		else if (lstaterank != rstaterank)
+			swap = (lstaterank > rstaterank);
+		else if (lbootvolume != rbootvolume)
+			swap = (lbootvolume < rbootvolume);
+		else if (lhs->volume_index != rhs->volume_index)
+			swap = (lhs->volume_index > rhs->volume_index);
+		else
+			swap = FALSE;
+	}
+
+	if (swap) {
+		*lhsp = rhs;
+		*rhsp = lhs;
+	}
+}
+
+static BG_STATUS save_current_config(struct EnvDataVolume *env)
 {
 	BG_STATUS result = BG_CONFIG_ERROR;
 	EFI_STATUS efistatus;
-	UINTN numHandles = volume_count;
-	UINTN *config_volumes;
 
-	config_volumes = (UINTN *)AllocatePool(sizeof(UINTN) *  volume_count);
-	if (!config_volumes) {
-		ERROR(L"Could not allocate memory for config partition mapping.\n");
-		return result;
-	}
-
-	if (EFI_ERROR(enumerate_cfg_parts(config_volumes, &numHandles))) {
-		ERROR(L"Could not enumerate config partitions.\n");
-		goto scc_cleanup;
-	}
-
-	numHandles = filter_cfg_parts(config_volumes, numHandles);
-
-	if (numHandles != ENV_NUM_CONFIG_PARTS) {
-		ERROR(L"Unexpected number of config partitions: found %d, but expected %d.\n",
-		      numHandles, ENV_NUM_CONFIG_PARTS);
-		/* In case of saving, this must be treated as error, to not
-		 * overwrite another partition's config file. */
-		goto scc_cleanup;
-	}
-
-	VOLUME_DESC *v = &volumes[config_volumes[current_partition]];
+	VOLUME_DESC *v = &volumes[env->volume_index];
 	EFI_FILE_HANDLE fh = NULL;
 	efistatus = open_cfg_file(v->root, &fh, EFI_FILE_MODE_WRITE |
 				  EFI_FILE_MODE_READ);
 	if (EFI_ERROR(efistatus)) {
 		ERROR(L"Could not open environment file on system partition %d: %r\n",
-		      current_partition, efistatus);
+		      env->volume_index, efistatus);
 		goto scc_cleanup;
 	}
 
-	UINTN writelen = sizeof(BG_ENVDATA);
+	uint32_t crc32 = -1;
 
-	uint32_t crc32;
-	(VOID) CalculateCrc32(
-	    &env[current_partition],
-	    sizeof(BG_ENVDATA) - sizeof(env[current_partition].crc32), &crc32);
-	env[current_partition].crc32 = crc32;
-	efistatus = fh->Write(fh, &writelen, (VOID *)&env[current_partition]);
+	efistatus = CalculateCrc32(
+	    &env->envdata,
+	    sizeof(BG_ENVDATA) - sizeof(env->envdata.crc32), &crc32);
+
+	if (!EFI_ERROR(efistatus)) {
+		UINTN writelen = sizeof(BG_ENVDATA);
+
+		env->envdata.crc32 = crc32;
+		efistatus = fh->Write(fh, &writelen, (VOID *)&env->envdata);
+	}
+
 	if (EFI_ERROR(efistatus)) {
 		ERROR(L"Cannot write environment to file: %r\n", efistatus);
 		(VOID) close_cfg_file(v->root, fh);
@@ -82,7 +138,70 @@ static BG_STATUS save_current_config(VOID)
 
 	result = BG_SUCCESS;
 scc_cleanup:
-	FreePool(config_volumes);
+	return result;
+}
+
+static EFI_STATUS read_config(
+	BOOLEAN *errored, const VOLUME_DESC *volume, BG_ENVDATA *envdata)
+{
+	EFI_STATUS result;
+
+	EFI_FILE_HANDLE fh = NULL;
+
+	result = open_cfg_file(volume->root, &fh, EFI_FILE_MODE_READ);
+	if (EFI_ERROR(result)) {
+
+		ERROR(L"Could not open environment file\n");
+		*errored = TRUE;
+		goto failed;
+	}
+
+	UINTN readlen = sizeof(*envdata);
+
+	result = read_cfg_file(fh, &readlen, (VOID *) envdata);
+
+	if (EFI_ERROR(close_cfg_file(volume->root, fh))) {
+		WARNING(L"Could not close environment config file\n");
+		*errored = TRUE;
+		/* Only fail if the read did not succeed */
+	}
+
+	if (EFI_ERROR(result)) {
+		ERROR(L"Cannot read environment file\n");
+		*errored = TRUE;
+		goto failed;
+	}
+
+	if (readlen != sizeof(BG_ENVDATA)) {
+		result = EFI_BAD_BUFFER_SIZE;
+		ERROR(L"Environment file has wrong size\n");
+		*errored = TRUE;
+		goto failed;
+	}
+
+	uint32_t crc32 = -1;
+
+	result = CalculateCrc32(
+	    envdata,
+	    sizeof(*envdata) - sizeof(envdata->crc32),
+	    &crc32);
+
+	if (EFI_ERROR(result)) {
+		ERROR(L"Unable to compute CRC32\n");
+		*errored = TRUE;
+		goto failed;
+	}
+
+	if (crc32 != envdata->crc32) {
+		result = EFI_CRC_ERROR;
+		ERROR(L"CRC32 error in environment data\n");
+		INFO(L"calculated: %lx\n", crc32);
+		INFO(L"stored: %lx\n", envdata->crc32);
+		*errored = TRUE;
+		goto failed;
+	}
+
+failed:
 	return result;
 }
 
@@ -90,156 +209,144 @@ BG_STATUS load_config(BG_LOADER_PARAMS *bglp)
 {
 	BG_STATUS result = BG_CONFIG_ERROR;
 	UINTN numHandles = volume_count;
-	UINTN *config_volumes;
-	UINTN i;
-	int env_invalid[ENV_NUM_CONFIG_PARTS] = {0};
+	UINTN *config_volumes = NULL;
+	BOOLEAN errored = FALSE;
 
-	env = (BG_ENVDATA *)AllocateZeroPool(sizeof(BG_ENVDATA) *
-					 ENV_NUM_CONFIG_PARTS);
-	if (!env) {
-		ERROR(L"Could not allocate memory for config data.\n");
-		return result;
+	/* Find all the viable configs, and place the most preferred
+	 * in rank_envdata[0], with the next preferred in rank_envdata[1]. */
+
+	const unsigned ENVSLOTS = 3;
+
+	struct EnvDataVolume env[ENVSLOTS];
+	struct EnvDataVolume *rank_envdata[ENVSLOTS];
+	struct EnvDataVolume *rsrv_envdata[ENVSLOTS];
+
+	for (unsigned edx = 0; edx < ENVSLOTS; ++edx) {
+		rank_envdata[edx] = NULL;
+		rsrv_envdata[edx] = env + edx;
+	}
+
+	if (!volume_count) {
+		ERROR(L"No volumes available for config partitions.\n");
+		goto failed;
 	}
 
 	config_volumes = (UINTN *)AllocatePool(sizeof(UINTN) * volume_count);
 	if (!config_volumes) {
 		ERROR(L"Could not allocate memory for config partition mapping.\n");
-		goto env_cleanup;
+		goto failed;
 	}
 
 	if (EFI_ERROR(enumerate_cfg_parts(config_volumes, &numHandles))) {
 		ERROR(L"Could not enumerate config partitions.\n");
-		goto lc_cleanup;
+		goto failed;
 	}
 
 	numHandles = filter_cfg_parts(config_volumes, numHandles);
 
-	if (numHandles > ENV_NUM_CONFIG_PARTS) {
-		ERROR(L"Too many config partitions found. Aborting.\n");
-		goto lc_cleanup;
-	}
-
-	result = BG_SUCCESS;
-
-	if (numHandles < ENV_NUM_CONFIG_PARTS) {
-		WARNING(L"Too few config partitions: found: %d, but expected %d.\n",
+	if (numHandles != ENV_NUM_CONFIG_PARTS) {
+		WARNING(L"Unexpected config partitions: found: %d, but expected %d.\n",
 			numHandles, ENV_NUM_CONFIG_PARTS);
 		/* Don't treat this as error because we may still be able to
 		 * find a valid config */
-		result = BG_CONFIG_PARTIALLY_CORRUPTED;
+		errored = TRUE;
 	}
 
-	/* Load all config data */
-	for (i = 0; i < numHandles; i++) {
-		EFI_FILE_HANDLE fh = NULL;
-		VOLUME_DESC *v = &volumes[config_volumes[i]];
-		if (EFI_ERROR(open_cfg_file(v->root, &fh,
-					    EFI_FILE_MODE_READ))) {
-			WARNING(L"Could not open environment file on config partition %d\n",
-				i);
-			result = BG_CONFIG_PARTIALLY_CORRUPTED;
+	struct EnvDataVolume **envrsrv = rsrv_envdata + ENVSLOTS;
+
+	/* Load the most recent config data */
+	for (UINTN ix = 0; ix < numHandles; ix++) {
+
+		struct EnvDataVolume **envrank = rank_envdata + ENVSLOTS;
+
+		if (!*--envrank)
+			*envrank = *--envrsrv;
+
+		envrank[0]->volume_index = config_volumes[ix];
+
+		INFO(L"Reading config file on volume %d.\n",
+			envrank[0]->volume_index);
+
+		BOOLEAN read_error = FALSE;
+		EFI_STATUS read_status = read_config(
+			&read_error,
+			&volumes[envrank[0]->volume_index],
+			&envrank[0]->envdata);
+
+		errored |= read_error;
+
+		if (read_error)
+			WARNING(L"Could not read environment file "
+				"on config partition %d\n", ix);
+
+		if (EFI_ERROR(read_status))
 			continue;
-		}
-		UINTN readlen = sizeof(BG_ENVDATA);
-		if (EFI_ERROR(read_cfg_file(fh, &readlen, (VOID *)&env[i])) ||
-		    readlen < sizeof(BG_ENVDATA)) {
-			ERROR(L"Cannot read environment from config partition %d.\n", i);
-			env_invalid[i] = 1;
-			if (EFI_ERROR(close_cfg_file(v->root, fh))) {
-				ERROR(L"Could not close environment config file.\n");
-			}
-			result = BG_CONFIG_PARTIALLY_CORRUPTED;
-			continue;
-		}
 
-		uint32_t crc32;
-		(VOID) CalculateCrc32(
-		    &env[i], sizeof(BG_ENVDATA) - sizeof(env[i].crc32), &crc32);
+		/* enforce NUL-termination of strings */
+		envrank[0]->envdata.kernelfile[ENV_STRING_LENGTH - 1] = 0;
+		envrank[0]->envdata.kernelparams[ENV_STRING_LENGTH - 1] = 0;
 
-		if (crc32 != env[i].crc32) {
-			ERROR(L"CRC32 error in environment data on config partition %d.\n",
-			      i);
-			INFO(L"calculated: %lx\n", crc32);
-			INFO(L"stored: %lx\n", env[i].crc32);
-			/* Don't treat this as fatal error because we may still
-			 * have
-			 * valid environments */
-			env_invalid[i] = 1;
-			result = BG_CONFIG_PARTIALLY_CORRUPTED;
-		}
+		/* Sift the most recently read config data to compare it
+		 * to the ones already read. */
 
-		if (EFI_ERROR(close_cfg_file(v->root, fh))) {
-			ERROR(L"Could not close environment config file.\n");
-			/* Don't abort, so we may still be able to boot a
-			 * config */
-			result = BG_CONFIG_PARTIALLY_CORRUPTED;
-		}
-
-		/* enforce NULL-termination of strings */
-		env[i].kernelfile[ENV_STRING_LENGTH - 1] = 0;
-		env[i].kernelparams[ENV_STRING_LENGTH - 1] = 0;
+		do {
+                    --envrank;
+                    sift_envdata_volume(envrank+0, envrank+1);
+                } while (envrank != rank_envdata);
 	}
 
-	/* Find environment with latest revision and check if there is a test
-	 * configuration. */
-	UINTN latest_rev = 0, latest_idx = 0;
-	UINTN pre_latest_rev = 0, pre_latest_idx = 0;
-	for (i = 0; i < ENV_NUM_CONFIG_PARTS; i++) {
-		if (!env_invalid[i]) {
-			if (env[i].revision > latest_rev) {
-				pre_latest_rev = latest_rev;
-				latest_rev = env[i].revision;
-				pre_latest_idx = latest_idx;
-				latest_idx = i;
-			} else if (env[i].revision > pre_latest_rev) {
-				/* we always need a 2nd iteration if
-				 * revisions are decreasing with growing i
-				 * so that pre_* gets set */
-				pre_latest_rev = env[i].revision;
-				pre_latest_idx = i;
-			}
-		}
+	/* Assume we boot with the latest configuration. Environments
+	 * that are in_progress are ranked lower. Ensure that there is
+	 * a most preferred environment, and it is not still in_progress. */
+
+	struct EnvDataVolume *next = rank_envdata[0];
+	struct EnvDataVolume *prev = rank_envdata[1];
+
+	if (!next || next->envdata.in_progress) {
+		ERROR(L"Could not find any valid config partition.\n");
+		goto failed;
 	}
 
-	/* Assume we boot with the latest configuration */
-	current_partition = latest_idx;
+	struct EnvDataVolume *latest = next;
 
-	/* Test if this environment is currently 'in_progress'. If yes,
-	 * do not boot from it, instead ignore it */
-	if (env[latest_idx].in_progress == 1) {
-		current_partition = pre_latest_idx;
-	} else if (env[latest_idx].ustate == USTATE_TESTING) {
+	if (latest->envdata.ustate == USTATE_TESTING) {
 		/* If it has already been booted, this indicates a failed
 		 * update. In this case, mark it as failed by giving a
 		 * zero-revision */
-		env[latest_idx].ustate = USTATE_FAILED;
-		env[latest_idx].revision = REVISION_FAILED;
-		save_current_config();
+		latest->envdata.ustate = USTATE_FAILED;
+		latest->envdata.revision = REVISION_FAILED;
+		save_current_config(latest);
 		/* We must boot with the configuration that was active before
+		 * if possible, otherwise try again with what is available.
 		 */
-		current_partition = pre_latest_idx;
-	} else if (env[latest_idx].ustate == USTATE_INSTALLED) {
+		if (!prev) {
+			ERROR(L"Could not find previous valid config partition.\n");
+			goto failed;
+		}
+		latest = prev;
+
+	} else if (latest->envdata.ustate == USTATE_INSTALLED) {
 		/* If this configuration has never been booted with, set ustate
 		 * to indicate that this configuration is now being tested */
-		env[latest_idx].ustate = USTATE_TESTING;
-		save_current_config();
+		latest->envdata.ustate = USTATE_TESTING;
+		save_current_config(latest);
 	}
 
-	bglp->payload_path = StrDuplicate(env[current_partition].kernelfile);
-	bglp->payload_options =
-	    StrDuplicate(env[current_partition].kernelparams);
-	bglp->timeout = env[current_partition].watchdog_timeout_sec;
+	bglp->payload_path = StrDuplicate(latest->envdata.kernelfile);
+	bglp->payload_options = StrDuplicate(latest->envdata.kernelparams);
+	bglp->timeout = latest->envdata.watchdog_timeout_sec;
 
-	INFO(L"Config Revision: %d:\n", latest_rev);
-	INFO(L" ustate: %d\n", env[current_partition].ustate);
+	INFO(L"Choosing config on volume %d.\n", latest->volume_index);
+	INFO(L"Config Revision: %d:\n", latest->envdata.revision);
+	INFO(L" ustate: %d\n", latest->envdata.ustate);
 	INFO(L" kernel: %s\n", bglp->payload_path);
 	INFO(L" args: %s\n", bglp->payload_options);
 	INFO(L" timeout: %d seconds\n", bglp->timeout);
 
-lc_cleanup:
+	result = errored ? BG_CONFIG_PARTIALLY_CORRUPTED : BG_SUCCESS;
+
+failed:
 	FreePool(config_volumes);
-env_cleanup:
-	FreePool(env);
 	return result;
 }
 
