@@ -64,7 +64,7 @@ static BG_STATUS save_current_config(VOID)
 	UINTN writelen = sizeof(BG_ENVDATA);
 
 	uint32_t crc32;
-	(VOID) BS->CalculateCrc32(
+	(VOID) CalculateCrc32(
 	    &env[current_partition],
 	    sizeof(BG_ENVDATA) - sizeof(env[current_partition].crc32), &crc32);
 	env[current_partition].crc32 = crc32;
@@ -153,7 +153,7 @@ BG_STATUS load_config(BG_LOADER_PARAMS *bglp)
 		}
 
 		uint32_t crc32;
-		(VOID) BS->CalculateCrc32(
+		(VOID) CalculateCrc32(
 		    &env[i], sizeof(BG_ENVDATA) - sizeof(env[i].crc32), &crc32);
 
 		if (crc32 != env[i].crc32) {
