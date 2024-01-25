@@ -27,6 +27,7 @@
 extern const unsigned long init_array_start[];
 extern const unsigned long init_array_end[];
 extern CHAR16 *boot_medium_path;
+extern CHAR16 *boot_medium_volume;
 
 #define PCI_GET_VENDOR_ID(id)	(UINT16)(id)
 #define PCI_GET_PRODUCT_ID(id)	(UINT16)((id) >> 16)
@@ -115,7 +116,6 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table)
 	BG_STATUS bg_status;
 	BG_LOADER_PARAMS bg_loader_params;
 	BG_INTERFACE_PARAMS bg_interface_params;
-	CHAR16 *tmp;
 
 	ZeroMem(&bg_loader_params, sizeof(bg_loader_params));
 
@@ -133,10 +133,10 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table)
 			   status);
 	}
 
-	tmp = DevicePathToStr(DevicePathFromHandle(loaded_image->DeviceHandle));
-	boot_medium_path = GetBootMediumPath(tmp);
-	FreePool(tmp);
-	INFO(L"Boot medium: %s\n", boot_medium_path);
+	boot_medium_volume = DevicePathToStr(DevicePathFromHandle(loaded_image->DeviceHandle));
+	boot_medium_path = GetBootMediumPath(boot_medium_volume);
+	INFO(L"Boot medium device: %s\n", boot_medium_volume);
+	INFO(L"Boot medium path: %s\n", boot_medium_path);
 
 	status = get_volumes(&volumes, &volume_count);
 	if (EFI_ERROR(status)) {
@@ -198,6 +198,7 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table)
 	FreePool(boot_medium_uuidstr);
 	FreePool(payload_dev_path);
 	FreePool(boot_medium_path);
+	FreePool(boot_medium_volume);
 
 	status = BS->OpenProtocol(payload_handle, &LoadedImageProtocol,
 				  (VOID **)&loaded_image, this_image,
