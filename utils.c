@@ -31,6 +31,22 @@ VOID PrintC(const UINT8 color, const CHAR16 *fmt, ...)
 	(VOID) ST->ConOut->SetAttribute(ST->ConOut, attr);
 }
 
+BOOLEAN IsOnBootVolume(EFI_DEVICE_PATH *dp)
+{
+	extern CHAR16 *boot_medium_volume;
+	CHAR16 *device_path;
+	BOOLEAN result = FALSE;
+
+	device_path = DevicePathToStr(dp);
+
+	if (StrCmp(device_path, boot_medium_volume) == 0) {
+		result = TRUE;
+	}
+	FreePool(device_path);
+
+	return result;
+}
+
 BOOLEAN IsOnBootMedium(EFI_DEVICE_PATH *dp)
 {
 	extern CHAR16 *boot_medium_path;

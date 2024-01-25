@@ -41,6 +41,7 @@ EFI_DEVICE_PATH *FileDevicePathFromConfig(EFI_HANDLE device,
 EFI_STATUS CalculateCrc32(VOID *pt, UINTN size, UINT32 *crc);
 CHAR16 *GetBootMediumPath(CHAR16 *input);
 BOOLEAN IsOnBootMedium(EFI_DEVICE_PATH *dp);
+BOOLEAN IsOnBootVolume(EFI_DEVICE_PATH *dp);
 
 VOID PrintC(const UINT8 color, const CHAR16 *fmt, ...);
 #define ERROR(fmt, ...)                                                        \
