@@ -22,6 +22,9 @@ AM_CFLAGS = \
 	-I$(top_srcdir)/tools/tests \
 	-I$(top_srcdir)/tests/fff \
 	-I$(top_srcdir) \
+	-Ix$(GNUEFI_SYS_DIR)/usr/include \
+	-I$(GNUEFI_INC_DIR) \
+	-I$(GNUEFI_INC_DIR)/$(ARCH) \
 	-include config.h \
 	-Wno-unused-parameter \
 	-Wmissing-prototypes \
@@ -68,13 +71,19 @@ check_PROGRAMS = test_bgenv_init_retval \
 		 test_ebgenv_api_internal \
 		 test_ebgenv_api \
 		 test_uservars \
-		 test_fat
+		 test_fat \
+		 test_fatvars
 
 FAT_TESTLIB=libenvapi_testlib_fat.a
 
 CLEANFILES += $(FAT_TESTLIB)
 
 SRC_TEST_COMMON=test_main.c
+
+test_fatvars_CFLAGS = $(AM_CFLAGS)
+test_fatvars_SOURCES = test_fatvars.c \
+		       ../../env/fatvars.c $(SRC_TEST_COMMON)
+test_fatvars_LDADD = $(FAT_TESTLIB) $(LIBCHECK_LIBS)
 
 test_bgenv_init_retval_CFLAGS = $(AM_CFLAGS)
 test_bgenv_init_retval_SOURCES = test_bgenv_init_retval.c $(SRC_TEST_COMMON)
