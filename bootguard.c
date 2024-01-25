@@ -20,3 +20,4 @@ EFI_HANDLE this_image;
 VOLUME_DESC *volumes = NULL;
 UINTN volume_count = 128;
 CHAR16 *boot_medium_path;
+CHAR16 *boot_medium_volume;
