@@ -41,6 +41,7 @@ EFI_DEVICE_PATH *FileDevicePathFromConfig(EFI_HANDLE device,
 EFI_STATUS CalculateCrc32(VOID *pt, UINTN size, UINT32 *crc);
 CHAR16 *GetBootMediumPath(CHAR16 *input);
 BOOLEAN IsOnBootMedium(EFI_DEVICE_PATH *dp);
+BOOLEAN IsOnBootVolume(EFI_DEVICE_PATH *dp);
 
 typedef EFI_STATUS (*WATCHDOG_PROBE)(EFI_PCI_IO *, UINT16, UINT16, UINTN);
 #define _CONCAT(prefix, func) prefix  ## func
