@@ -295,3 +295,8 @@ CHAR16 *GetBootMediumPath(CHAR16 *input)
 
 	return dst;
 }
+
+EFI_STATUS CalculateCrc32(VOID *pt, UINTN size, UINT32 *crc)
+{
+	return BS->CalculateCrc32(pt, size, crc);
+}
